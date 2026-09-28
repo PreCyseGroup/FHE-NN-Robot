@@ -241,6 +241,7 @@ def main():
             x = float(trajectory["x"][k0] + rng.uniform(-POS_PERTURB, POS_PERTURB))
             y = float(trajectory["y"][k0] + rng.uniform(-POS_PERTURB, POS_PERTURB))
             theta = float(trajectory["theta"][k0] + rng.uniform(-HEADING_PERTURB, HEADING_PERTURB))
+            v = float(rng.uniform(-V_PERTURB, V_PERTURB))
             robot_v = 0.0
 
             translation.setSFVec3f([x, y, z0])
