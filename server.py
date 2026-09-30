@@ -15,13 +15,13 @@ try:
 except ImportError:
     ts = None
 
-
 HOST = os.environ.get("AMR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AMR_PORT", "50007"))
 MODE = os.environ.get("AMR_MODE", "auto").lower()
 MODEL_PATH = Path(os.environ.get("AMR_MODEL", "model_export.json"))
 OUTPUT_DIR = Path(os.environ.get("AMR_SAVE", "."))
 
+N_INPUTS = 5
 KX, KY, KTH = 2.0, 9.0, 6.0
 WHEEL_RADIUS = 0.04445
 WHEELBASE = 0.393
@@ -52,12 +52,19 @@ def load_model(path):
     with path.open("r", encoding="utf-8") as f:
         export = json.load(f)
 
+    fc1_w = np.asarray(export["fc1_weight"], dtype=np.float64)
+    if fc1_w.ndim != 2 or fc1_w.shape[0] != N_INPUTS:
+        raise RuntimeError(
+            f"Expected a {N_INPUTS}-input model, but fc1_weight has shape "
+            f"{fc1_w.shape}. Retrain with the new train.py."
+        )
+
     return {
         "fc1_weight": export["fc1_weight"],
         "fc1_bias": export["fc1_bias"],
         "fc3_weight": export["fc3_weight"],
         "fc3_bias": export["fc3_bias"],
-        "fc1_w": np.asarray(export["fc1_weight"], dtype=np.float64),
+        "fc1_w": fc1_w,
         "fc1_b": np.asarray(export["fc1_bias"], dtype=np.float64),
         "fc3_w": np.asarray(export["fc3_weight"], dtype=np.float64),
         "fc3_b": np.asarray(export["fc3_bias"], dtype=np.float64),
@@ -69,7 +76,12 @@ def clip_wheel(value):
 
 
 def kanayama_from_features(features):
-    ex, ey, eth, v_ref, _robot_v, omega_ref = map(float, features)
+    if len(features) != N_INPUTS:
+        raise ValueError(
+            f"Kanayama mode expects {N_INPUTS} features, got {len(features)}"
+        )
+
+    ex, ey, eth, v_ref, omega_ref = map(float, features)
     v_cmd = v_ref * math.cos(eth) + KX * ex
     omega_cmd = omega_ref + v_ref * (KY * ey + KTH * math.sin(eth))
     wr = (v_cmd + 0.5 * WHEELBASE * omega_cmd) / WHEEL_RADIUS
@@ -99,6 +111,10 @@ def compute_response(mode, payload, model, context):
             wr, wl = kanayama_from_features(features)
             response = json.dumps({"wr": wr, "wl": wl}).encode()
         else:
+            if len(features) != N_INPUTS:
+                raise ValueError(
+                    f"Plaintext NN expects {N_INPUTS} features, got {len(features)}"
+                )
             y = plaintext_forward(np.asarray(features, dtype=np.float64), model)
             response = json.dumps({"y": [float(y[0]), float(y[1])]}).encode()
 
@@ -167,7 +183,10 @@ def main():
     if model is not None:
         print(f"[Server] Model loaded from {MODEL_PATH}")
     else:
-        print(f"[Server] Model file not found at {MODEL_PATH}; Kanayama mode is still available.")
+        print(
+            f"[Server] Model file not found at {MODEL_PATH}; "
+            "Kanayama mode is still available."
+        )
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
