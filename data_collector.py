@@ -1,8 +1,14 @@
 """Collect Webots imitation-learning data from the Kanayama controller.
 
 The saved dataset contains:
-    features = [e_x, e_y, e_theta, v_ref, v_robot, omega_ref]
+    features = [e_x, e_y, e_theta, v_ref, omega_ref]
     targets  = [omega_r, omega_l]
+
+Data collection is designed for reproducibility and broad state-space coverage:
+- trajectory generation uses its own RNG;
+- rollout start phases are evenly distributed, not randomly selected;
+- initial tracking-error perturbations come from a seeded Sobol sequence;
+- each rollout is short and focused on recovery behavior.
 
 The controller runs every 100 ms while Webots advances with a 10 ms step.
 """
@@ -13,9 +19,13 @@ from pathlib import Path
 import numpy as np
 from controller import Supervisor
 from scipy.interpolate import CubicSpline
+from scipy.stats import qmc
 
 
 SEED = 42
+TRAJECTORY_SEED = SEED
+PERTURBATION_SEED = SEED + 1
+
 WHEEL_RADIUS = 0.04445
 WHEELBASE = 0.393
 WHEEL_SPEED_LIMIT = 10.0
@@ -34,10 +44,16 @@ TRAJECTORY_NAMES = [
     "hypotrochoid",
     "random_spline",
 ]
-N_ROLLOUTS_PER_TRAJECTORY = 40
-POS_PERTURB = 0.3
-HEADING_PERTURB = 0.7
-V_PERTURB = 0.10
+
+# Many short recovery rollouts are more useful than a few long rollouts.
+N_START_POINTS = 16
+N_PERTURBATIONS = 32  # Keep this a power of two for Sobol random_base2().
+ROLLOUT_STEPS = 40    # 4.0 s at CONTROL_DT = 0.1 s.
+
+# Initial tracking-error ranges.
+EX_PERTURB = 0.30
+EY_PERTURB = 0.30
+HEADING_PERTURB = 0.70
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DATASET_PATH = Path(os.environ.get("AMR_DATASET", PROJECT_DIR / "webots_dataset.npz"))
@@ -89,13 +105,29 @@ def make_trajectory(name, rng):
         t = np.arange(0.0, duration + CONTROL_DT, CONTROL_DT)
         exponent = 3.2
         tau_dense = np.linspace(0.0, 2.0 * np.pi, 200_000)
-        x_dense = 0.85 * np.sign(np.cos(tau_dense)) * np.abs(np.cos(tau_dense)) ** (2.0 / exponent)
-        y_dense = 0.85 * np.sign(np.sin(tau_dense)) * np.abs(np.sin(tau_dense)) ** (2.0 / exponent)
+        x_dense = (
+            0.85
+            * np.sign(np.cos(tau_dense))
+            * np.abs(np.cos(tau_dense)) ** (2.0 / exponent)
+        )
+        y_dense = (
+            0.85
+            * np.sign(np.sin(tau_dense))
+            * np.abs(np.sin(tau_dense)) ** (2.0 / exponent)
+        )
         ds = np.sqrt(np.diff(x_dense) ** 2 + np.diff(y_dense) ** 2)
         s = np.concatenate(([0.0], np.cumsum(ds)))
         tau = np.interp((t / duration) * s[-1], s, tau_dense)
-        x = 0.85 * np.sign(np.cos(tau)) * np.abs(np.cos(tau)) ** (2.0 / exponent)
-        y = 0.85 * np.sign(np.sin(tau)) * np.abs(np.sin(tau)) ** (2.0 / exponent)
+        x = (
+            0.85
+            * np.sign(np.cos(tau))
+            * np.abs(np.cos(tau)) ** (2.0 / exponent)
+        )
+        y = (
+            0.85
+            * np.sign(np.sin(tau))
+            * np.abs(np.sin(tau)) ** (2.0 / exponent)
+        )
 
     elif name == "spiral":
         t = np.arange(0.0, duration + CONTROL_DT, CONTROL_DT)
@@ -119,8 +151,12 @@ def make_trajectory(name, rng):
         t = np.arange(0.0, duration + CONTROL_DT, CONTROL_DT)
         tau = np.linspace(0.0, 8.0 * np.pi, len(t))
         R, r, d, scale = 5.0, 3.0, 4.0, 0.12
-        x = scale * ((R - r) * np.cos(tau) + d * np.cos((R - r) / r * tau))
-        y = scale * ((R - r) * np.sin(tau) - d * np.sin((R - r) / r * tau))
+        x = scale * (
+            (R - r) * np.cos(tau) + d * np.cos((R - r) / r * tau)
+        )
+        y = scale * (
+            (R - r) * np.sin(tau) - d * np.sin((R - r) / r * tau)
+        )
 
     elif name == "random_spline":
         t = np.arange(0.0, duration + CONTROL_DT, CONTROL_DT)
@@ -154,7 +190,43 @@ def make_trajectory(name, rng):
     }
 
 
-def tracking_features(x, y, theta, robot_v, trajectory, k):
+def make_perturbations():
+    """Create deterministic, well-spread initial tracking-error samples."""
+    if N_PERTURBATIONS <= 0 or (N_PERTURBATIONS & (N_PERTURBATIONS - 1)) != 0:
+        raise ValueError("N_PERTURBATIONS must be a positive power of two")
+
+    m = int(np.log2(N_PERTURBATIONS))
+    sampler = qmc.Sobol(d=3, scramble=True, seed=PERTURBATION_SEED)
+    unit = sampler.random_base2(m=m)
+    perturbations = qmc.scale(
+        unit,
+        [-EX_PERTURB, -EY_PERTURB, -HEADING_PERTURB],
+        [EX_PERTURB, EY_PERTURB, HEADING_PERTURB],
+    )
+
+    # Guarantee that the nominal state is represented exactly.
+    perturbations[0] = np.array([0.0, 0.0, 0.0])
+    return perturbations
+
+
+def pose_from_tracking_error(trajectory, k, ex, ey, eth):
+    """Construct a robot pose that has the requested Kanayama tracking errors."""
+    theta_ref = float(trajectory["theta"][k])
+    theta = theta_ref - float(eth)
+
+    c = np.cos(theta)
+    s = np.sin(theta)
+
+    # [ex, ey]^T = R(-theta) * ([x_ref, y_ref] - [x, y])
+    dx = c * ex - s * ey
+    dy = s * ex + c * ey
+
+    x = float(trajectory["x"][k] - dx)
+    y = float(trajectory["y"][k] - dy)
+    return x, y, theta
+
+
+def tracking_features(x, y, theta, trajectory, k):
     dx = trajectory["x"][k] - x
     dy = trajectory["y"][k] - y
     return np.array(
@@ -163,7 +235,6 @@ def tracking_features(x, y, theta, robot_v, trajectory, k):
             -np.sin(theta) * dx + np.cos(theta) * dy,
             wrap_to_pi(trajectory["theta"][k] - theta),
             trajectory["speed"][k],
-            robot_v,
             trajectory["omega"][k],
         ],
         dtype=np.float32,
@@ -198,9 +269,10 @@ def step_control_period(robot):
 
 
 def main():
-    rng = np.random.RandomState(SEED)
-    robot = Supervisor()
+    trajectory_rng = np.random.default_rng(TRAJECTORY_SEED)
+    perturbations = make_perturbations()
 
+    robot = Supervisor()
     robot_node = robot.getSelf()
     translation = robot_node.getField("translation")
     rotation = robot_node.getField("rotation")
@@ -217,70 +289,108 @@ def main():
     gps.enable(SIM_TIMESTEP_MS)
     compass.enable(SIM_TIMESTEP_MS)
 
-    trajectories = {name: make_trajectory(name, rng) for name in TRAJECTORY_NAMES}
+    trajectories = {
+        name: make_trajectory(name, trajectory_rng) for name in TRAJECTORY_NAMES
+    }
+
     features = []
     targets = []
 
-    expected_samples = sum(len(traj["t"]) for traj in trajectories.values()) * N_ROLLOUTS_PER_TRAJECTORY
+    rollouts_per_trajectory = N_START_POINTS * N_PERTURBATIONS
+    expected_samples = (
+        len(TRAJECTORY_NAMES)
+        * rollouts_per_trajectory
+        * ROLLOUT_STEPS
+    )
+
     print(
         f"[Collector] Starting data collection: {len(TRAJECTORY_NAMES)} trajectories, "
-        f"{N_ROLLOUTS_PER_TRAJECTORY} rollouts each, {expected_samples} expected samples."
+        f"{N_START_POINTS} start phases, {N_PERTURBATIONS} perturbations per phase, "
+        f"{ROLLOUT_STEPS} steps per rollout, {expected_samples} expected samples."
     )
 
     for trajectory_index, (trajectory_name, trajectory) in enumerate(
         trajectories.items(), start=1
     ):
         n = len(trajectory["t"])
+        if n < ROLLOUT_STEPS:
+            raise ValueError(
+                f"Trajectory {trajectory_name} has only {n} samples, "
+                f"but ROLLOUT_STEPS={ROLLOUT_STEPS}."
+            )
+
+        # Avoid wrap-around discontinuities by ensuring every rollout stays
+        # inside the stored reference trajectory.
+        max_start = n - ROLLOUT_STEPS
+        start_indices = np.linspace(
+            0,
+            max_start,
+            N_START_POINTS,
+            dtype=int,
+        )
+
         print(
             f"[Collector] Trajectory {trajectory_index}/{len(TRAJECTORY_NAMES)}: "
             f"{trajectory_name}"
         )
 
-        for rollout_index in range(1, N_ROLLOUTS_PER_TRAJECTORY + 1):
-            k0 = int(rng.randint(0, n))
-            x = float(trajectory["x"][k0] + rng.uniform(-POS_PERTURB, POS_PERTURB))
-            y = float(trajectory["y"][k0] + rng.uniform(-POS_PERTURB, POS_PERTURB))
-            theta = float(trajectory["theta"][k0] + rng.uniform(-HEADING_PERTURB, HEADING_PERTURB))
-            v = float(rng.uniform(-V_PERTURB, V_PERTURB))
-            robot_v = 0.0
+        rollout_counter = 0
+        for start_number, k0 in enumerate(start_indices, start=1):
+            for perturb_number, (ex0, ey0, eth0) in enumerate(
+                perturbations, start=1
+            ):
+                rollout_counter += 1
 
-            translation.setSFVec3f([x, y, z0])
-            rotation.setSFRotation([0.0, 0.0, 1.0, theta % (2.0 * np.pi)])
-            robot_node.resetPhysics()
-
-            prev_x, prev_y = x, y
-
-            for step in range(n):
-                k = (k0 + step) % n
-
-                if step > 0:
-                    new_x, new_y, theta = read_pose(gps, compass)
-                    robot_v = float(np.hypot(new_x - prev_x, new_y - prev_y) / CONTROL_DT)
-                    x, y = new_x, new_y
-                    prev_x, prev_y = x, y
-
-                features.append(tracking_features(x, y, theta, robot_v, trajectory, k))
-                wr, wl = kanayama_controller(x, y, theta, trajectory, k)
-                targets.append(np.array([wr, wl], dtype=np.float32))
-
-                right_motor.setVelocity(wr)
-                left_motor.setVelocity(wl)
-
-                if not step_control_period(robot):
-                    raise RuntimeError("Webots simulation stopped during data collection")
-
-            if rollout_index % 10 == 0 or rollout_index == N_ROLLOUTS_PER_TRAJECTORY:
-                print(
-                    f"[Collector]   {trajectory_name}: rollout "
-                    f"{rollout_index}/{N_ROLLOUTS_PER_TRAJECTORY} complete; "
-                    f"samples collected: {len(features)}"
+                x, y, theta = pose_from_tracking_error(
+                    trajectory,
+                    int(k0),
+                    float(ex0),
+                    float(ey0),
+                    float(eth0),
                 )
+
+                # Remove any physical motion left from the previous rollout.
+                right_motor.setVelocity(0.0)
+                left_motor.setVelocity(0.0)
+                translation.setSFVec3f([x, y, z0])
+                rotation.setSFRotation([0.0, 0.0, 1.0, theta % (2.0 * np.pi)])
+                robot_node.resetPhysics()
+
+                for step in range(ROLLOUT_STEPS):
+                    k = int(k0) + step
+
+                    if step > 0:
+                        x, y, theta = read_pose(gps, compass)
+
+                    features.append(
+                        tracking_features(x, y, theta, trajectory, k)
+                    )
+                    wr, wl = kanayama_controller(x, y, theta, trajectory, k)
+                    targets.append(np.array([wr, wl], dtype=np.float32))
+
+                    right_motor.setVelocity(wr)
+                    left_motor.setVelocity(wl)
+
+                    if not step_control_period(robot):
+                        raise RuntimeError(
+                            "Webots simulation stopped during data collection"
+                        )
+
+                if rollout_counter % 64 == 0 or (
+                    start_number == N_START_POINTS
+                    and perturb_number == N_PERTURBATIONS
+                ):
+                    print(
+                        f"[Collector]   {trajectory_name}: rollout "
+                        f"{rollout_counter}/{rollouts_per_trajectory} complete; "
+                        f"samples collected: {len(features)}"
+                    )
 
     print("[Collector] Data collection complete. Saving dataset...")
     right_motor.setVelocity(0.0)
     left_motor.setVelocity(0.0)
 
-    features = np.asarray(features, dtype=np.float32).reshape(-1, 6)
+    features = np.asarray(features, dtype=np.float32).reshape(-1, 5)
     targets = np.asarray(targets, dtype=np.float32).reshape(-1, 2)
 
     DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +405,14 @@ def main():
         kx=KX,
         ky=KY,
         kth=KTH,
+        feature_names=np.array(
+            ["e_x", "e_y", "e_theta", "v_ref", "omega_ref"]
+        ),
+        n_start_points=N_START_POINTS,
+        n_perturbations=N_PERTURBATIONS,
+        rollout_steps=ROLLOUT_STEPS,
+        trajectory_seed=TRAJECTORY_SEED,
+        perturbation_seed=PERTURBATION_SEED,
     )
     print(f"[Collector] Saved {len(features)} samples to {DATASET_PATH}")
 
