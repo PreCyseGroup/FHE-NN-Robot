@@ -3,6 +3,9 @@
 The client runs a 50 s Lissajous tracking experiment with a 100 ms control
 period. Remote inference is performed in a background thread and the most
 recent wheel command is held until the next response arrives.
+
+The controller input is:
+    [e_x, e_y, e_theta, v_ref, omega_ref]
 """
 
 import json
@@ -23,6 +26,7 @@ except ImportError:
     ts = None
 
 
+N_INPUTS = 5
 WHEEL_RADIUS = 0.04445
 WHEELBASE = 0.393
 WHEEL_SPEED_LIMIT = 10.0
@@ -94,7 +98,7 @@ class TrajectoryReference:
         )
 
 
-def tracking_features(x, y, theta, robot_v, reference, t):
+def tracking_features(x, y, theta, reference, t):
     x_ref, y_ref, theta_ref, v_ref, omega_ref = reference.query(t)
     dx = x_ref - x
     dy = y_ref - y
@@ -104,12 +108,10 @@ def tracking_features(x, y, theta, robot_v, reference, t):
             -np.sin(theta) * dx + np.cos(theta) * dy,
             wrap_to_pi(theta_ref - theta),
             v_ref,
-            robot_v,
             omega_ref,
         ],
         dtype=np.float64,
     )
-
 
 
 def add_reference_path(robot, reference):
@@ -271,11 +273,11 @@ class AsyncRemoteController:
         with self._lock:
             return self.wheel_speeds
 
-    def schedule(self, x, y, theta, robot_v, control_t):
-        self._queue.put((x, y, theta, robot_v, control_t))
+    def schedule(self, x, y, theta, control_t):
+        self._queue.put((x, y, theta, control_t))
 
-    def _prepare_features(self, x, y, theta, robot_v, t):
-        raw = tracking_features(x, y, theta, robot_v, self.reference, t)
+    def _prepare_features(self, x, y, theta, t):
+        raw = tracking_features(x, y, theta, self.reference, t)
         if self.mode == "kanayama":
             return raw, None
         return raw, (raw - self.x_mean) / self.x_std
@@ -326,13 +328,13 @@ class AsyncRemoteController:
         self.network_server_times_ms.append(network_server)
         self.response_processing_times_ms.append(response)
 
-    def warmup(self, x, y, theta, robot_v, t):
-        raw, normalized = self._prepare_features(x, y, theta, robot_v, t)
+    def warmup(self, x, y, theta, t):
+        raw, normalized = self._prepare_features(x, y, theta, t)
         for _ in range(N_WARMUP_REQUESTS):
             self._round_trip(raw, normalized)
 
-    def prime(self, x, y, theta, robot_v, t):
-        raw, normalized = self._prepare_features(x, y, theta, robot_v, t)
+    def prime(self, x, y, theta, t):
+        raw, normalized = self._prepare_features(x, y, theta, t)
         wr, wl, rtt, prep, net, response = self._round_trip(raw, normalized)
         wr, wl = clip_wheels(wr, wl)
         with self._lock:
@@ -347,9 +349,9 @@ class AsyncRemoteController:
                 self._queue.task_done()
                 return
 
-            x, y, theta, robot_v, t = item
+            x, y, theta, t = item
             try:
-                raw, normalized = self._prepare_features(x, y, theta, robot_v, t)
+                raw, normalized = self._prepare_features(x, y, theta, t)
                 wr, wl, rtt, prep, net, response = self._round_trip(raw, normalized)
                 wr, wl = clip_wheels(wr, wl)
 
@@ -378,14 +380,22 @@ class AsyncRemoteController:
 def load_normalization():
     if not MODEL_PATH.exists():
         raise SystemExit(f"Model not found: {MODEL_PATH}. Run train.py first.")
+
     with MODEL_PATH.open("r", encoding="utf-8") as f:
         export = json.load(f)
-    return (
-        np.asarray(export["x_mean"], dtype=np.float64),
-        np.asarray(export["x_std"], dtype=np.float64),
-        np.asarray(export["y_mean"], dtype=np.float64),
-        np.asarray(export["y_std"], dtype=np.float64),
-    )
+
+    x_mean = np.asarray(export["x_mean"], dtype=np.float64)
+    x_std = np.asarray(export["x_std"], dtype=np.float64)
+    y_mean = np.asarray(export["y_mean"], dtype=np.float64)
+    y_std = np.asarray(export["y_std"], dtype=np.float64)
+
+    if len(x_mean) != N_INPUTS or len(x_std) != N_INPUTS:
+        raise SystemExit(
+            f"Expected normalization for {N_INPUTS} inputs, but model contains "
+            f"{len(x_mean)}. Retrain with the new 5-input train.py."
+        )
+
+    return x_mean, x_std, y_mean, y_std
 
 
 def connect_to_server(requested_mode):
@@ -409,7 +419,10 @@ def main():
         raise SystemExit("AMR_MODE must be kanayama, plaintext, or ckks")
 
     reference = TrajectoryReference()
-    print(f"[Client] Connecting to {SERVER_HOST}:{SERVER_PORT} (requested mode: {MODE})...")
+    print(
+        f"[Client] Connecting to {SERVER_HOST}:{SERVER_PORT} "
+        f"(requested mode: {MODE})..."
+    )
     sock, mode = connect_to_server(MODE)
     print(f"[Client] Connected. Active mode: {mode}")
 
@@ -434,6 +447,7 @@ def main():
     robot = Supervisor()
     add_reference_path(robot, reference)
     print("[Client] Reference trajectory added to the Webots world.")
+
     node = robot.getSelf()
     translation = node.getField("translation")
     rotation = node.getField("rotation")
@@ -467,9 +481,10 @@ def main():
     )
 
     print(f"[Client] Running {N_WARMUP_REQUESTS} warm-up requests...")
-    controller.warmup(x0, y0, theta0, 0.0, 0.0)
+    controller.warmup(x0, y0, theta0, 0.0)
     print("[Client] Warm-up complete. Starting 50 s evaluation...")
-    wr0, wl0 = controller.prime(x0, y0, theta0, 0.0, 0.0)
+
+    wr0, wl0 = controller.prime(x0, y0, theta0, 0.0)
     right_motor.setVelocity(wr0)
     left_motor.setVelocity(wl0)
     controller.start()
@@ -477,7 +492,6 @@ def main():
     next_control_index = 1
     actual_positions = []
     reference_positions = []
-    previous_position = None
     next_progress_time = 10.0
 
     while robot.step(SIM_TIMESTEP_MS) != -1:
@@ -489,13 +503,6 @@ def main():
         north = compass.getValues()
         theta = float(np.arctan2(north[0], north[1]))
 
-        if previous_position is None:
-            robot_v = 0.0
-        else:
-            dt = SIM_TIMESTEP_MS / 1000.0
-            robot_v = float(np.hypot(x - previous_position[0], y - previous_position[1]) / dt)
-        previous_position = (x, y)
-
         sim_time = float(robot.getTime())
         while (
             next_control_index < len(reference.t)
@@ -505,7 +512,6 @@ def main():
                 x,
                 y,
                 theta,
-                robot_v,
                 float(reference.t[next_control_index]),
             )
             next_control_index += 1
@@ -520,8 +526,9 @@ def main():
 
         if sim_time + 1e-9 >= next_progress_time:
             print(
-                f"[Client] Simulation progress: {min(next_progress_time, MAX_SIM_TIME):.0f}/"
-                f"{MAX_SIM_TIME:.0f} s; completed control requests: "
+                f"[Client] Simulation progress: "
+                f"{min(next_progress_time, MAX_SIM_TIME):.0f}/{MAX_SIM_TIME:.0f} s; "
+                f"completed control requests: "
                 f"{len(controller.round_trip_times_ms)}/{len(reference.t)}"
             )
             next_progress_time += 10.0
