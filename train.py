@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 SEED = 42
+N_INPUTS = 5
 EPOCHS = 16
 HIDDEN_DIM = 64
 BATCH_SIZE = 1024
@@ -23,11 +24,11 @@ MODEL_PATH = Path(os.environ.get("AMR_MODEL", "model_export.json"))
 
 
 class OffsetSquareActivationMLP(nn.Module):
-    """6 -> 64 -> 2 MLP with p(z) = z + 0.125 z^2."""
+    """5 -> 64 -> 2 MLP with p(z) = z + 0.125 z^2."""
 
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(6, HIDDEN_DIM)
+        self.fc1 = nn.Linear(N_INPUTS, HIDDEN_DIM)
         self.fc3 = nn.Linear(HIDDEN_DIM, 2)
 
     @staticmethod
@@ -68,6 +69,8 @@ def train_model(x_train, y_train, device):
 
 def export_model(model, x_mean, x_std, y_mean, y_std):
     export = {
+        "n_inputs": N_INPUTS,
+        "feature_names": ["e_x", "e_y", "e_theta", "v_ref", "omega_ref"],
         # Transposed to [input][output] for NumPy and TenSEAL matmul.
         "fc1_weight": model.fc1.weight.detach().cpu().numpy().T.tolist(),
         "fc1_bias": model.fc1.bias.detach().cpu().numpy().tolist(),
@@ -97,9 +100,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Train] Using device: {device}")
     print(f"[Train] Loading dataset: {DATASET_PATH}")
+
     data = np.load(DATASET_PATH)
     x_raw = data["features"].astype(np.float64)
     y_raw = data["targets"].astype(np.float64)
+
+    if x_raw.ndim != 2 or x_raw.shape[1] != N_INPUTS:
+        raise SystemExit(
+            f"Expected dataset features with shape (N, {N_INPUTS}), "
+            f"but got {x_raw.shape}. Regenerate the dataset with the new collector."
+        )
 
     x_mean = x_raw.mean(axis=0)
     x_std = x_raw.std(axis=0) + 1e-6
