@@ -1,10 +1,10 @@
-# Encrypted Cloud-Based Neural Network Controller for a Differential-Drive Robot
+# Encrypted Cloud-Based Neural Network Controller for Differential-Drive Robots
 
-This repository accompanies the paper **"Encrypted Cloud-Based Neural Network Controller for a Differential-Drive Robot"**.
+This repository accompanies the paper **"Encrypted Cloud-Based Neural Network Controller for Differential-Drive Robots"**.
 
 Cloud-based robot control can provide access to powerful remote computing resources, but it also creates privacy concerns because sensitive robot states, reference commands, and control outputs may be exposed to the cloud. This work investigates how homomorphic encryption can be used to protect this information while still allowing a remote server to perform neural-network-based control.
 
-The proposed approach uses a compact neural, with  a quadratic polynomial activation function, to approximate a classical Kanayama tracking controller. During online operation, the robot computes its tracking features locally, encrypts them using the CKKS homomorphic encryption scheme, and sends them to the server. The server evaluates the neural network directly on the encrypted data without decrypting it, and the encrypted control output is returned to the robot for local decryption and actuation.
+The proposed approach uses a compact neural network with a quadratic polynomial activation function to approximate a classical Kanayama tracking controller. During online operation, the robot computes its tracking features locally, encrypts them using the CKKS homomorphic encryption scheme, and sends them to the server. The server evaluates the neural network directly on the encrypted data without decrypting it, and the encrypted control output is returned to the robot for local decryption and actuation.
 
 The framework is implemented in Webots using a client-server architecture and is evaluated by comparing three controller modes:
 
@@ -27,7 +27,7 @@ This repository provides the Webots simulation, dataset generation, neural-netwo
 | File / directory | Purpose |
 |---|---|
 | `data_collector.py` | Webots controller used to generate the training dataset with the Kanayama controller. |
-| `train.py` | Trains the 6-64-2 neural network and exports `model_export.json`. |
+| `train.py` | Trains the 5-64-2 neural network and exports `model_export.json`. |
 | `client.py` | Webots evaluation client. It supports Kanayama, plaintext NN, and CKKS NN modes and saves the run data. |
 | `server.py` | Inference server for the three controller modes. |
 | `requirements.txt` | Python dependencies. |
@@ -65,10 +65,10 @@ The workflow tested for this repository is **Windows**. The commands below there
 | Wheel-speed limit | +/-10 rad/s |
 | Kanayama gains | `Kx=2.0`, `Ky=9.0`, `Ktheta=6.0` |
 
-The six neural-network inputs are:
+The five neural-network inputs are:
 
 ```text
-[e_x, e_y, e_theta, v_ref, v_robot, omega_ref]
+[e_x, e_y, e_theta, v_ref, omega_ref]
 ```
 
 The two outputs are the right and left wheel commands:
@@ -96,16 +96,22 @@ The Lissajous trajectory is **not** used for training. It is reserved for the fi
 
 Dataset settings:
 
-- 40 rollouts per training trajectory
-- random seed: `42`
-- position perturbation: `+/-0.3 m`
-- heading perturbation: `+/-0.7 rad`
-- velocity perturbation: `+/-0.10 m/s`
-- expected dataset size: **192,680 feature-target pairs**
+- 16 evenly distributed rollout starting points per training trajectory
+- 32 initial tracking-error states per starting point
+- 40 control samples per rollout (`4.0 s` at `Ts = 0.1 s`)
+- trajectory seed: `42`
+- scrambled Sobol perturbation seed: `43`
+- initial `e_x` range: `[-0.30, 0.30] m`
+- initial `e_y` range: `[-0.30, 0.30] m`
+- initial `e_theta` range: `[-0.70, 0.70] rad`
+- one perturbation state is explicitly set to the nominal zero-error state `[0, 0, 0]`
+- 512 rollouts per training trajectory (`16 x 32`)
+- 20,480 feature-target pairs per trajectory (`16 x 32 x 40`)
+- total dataset size: **163,840 feature-target pairs**
 
 ### Neural network
 
-- architecture: `6 -> 64 -> 2`
+- architecture: `5 -> 64 -> 2`
 - activation: `p(z) = z + 0.125 z^2`
 - optimizer: AdamW
 - epochs: `16`
@@ -126,8 +132,11 @@ Dataset settings:
 - unseen trajectory: 50 s Lissajous path
 - measured control requests: 501 (`t = 0.0, 0.1, ..., 50.0 s`)
 - two additional warm-up requests are executed before the measured run
+- remote inference runs in a background thread; the most recently available wheel command is held until the next response arrives
 
 For the paper experiment, the Webots client and the inference server ran on the same workstation and communicated through the loopback interface (`127.0.0.1`).
+
+The paper test workstation used an Intel Core i9-14900K processor, an NVIDIA RTX 2000 Ada Generation GPU with 16 GB of GPU memory, and 32 GB of DDR5 RAM.
 
 ---
 
@@ -177,7 +186,7 @@ Open the following world in Webots:
 Webots/world/world.wbt
 ```
 
-Reset the simulation and run it in **fast mode (`>>`)**. The collector prints occasional progress messages while it processes the eight trajectories and 40 rollouts per trajectory.
+Reset the simulation and run it in **fast mode (`>>`)**. The collector prints occasional progress messages while it processes the eight trajectories. For each trajectory it uses 16 starting points and 32 initial tracking-error states, producing 512 short recovery rollouts of 40 control samples each.
 
 When collection is complete, the following file is created:
 
@@ -188,7 +197,7 @@ Webots/webots_dataset.npz
 The expected number of samples is:
 
 ```text
-192680
+163840
 ```
 
 Copy the dataset to the repository root so that it is next to `train.py`:
@@ -289,7 +298,7 @@ ckks
 The active Webots controller contains a line equivalent to:
 
 ```python
-MODE = os.environ.get("AMR_MODE", "kanayama").lower()
+MODE = os.environ.get("AMR_MODE", "ckks").lower()
 ```
 
 The most direct method on Windows is to change the default string before each run:
